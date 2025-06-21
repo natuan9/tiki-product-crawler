@@ -1,3 +1,4 @@
+import logging
 from ratelimit import limits, sleep_and_retry
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 import requests
@@ -10,6 +11,11 @@ import csv
 from bs4 import BeautifulSoup
 import time
 from typing import Tuple
+
+logging.basicConfig(
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    level=logging.INFO
+)
 
 # === Configuration ===
 API_URL = "https://api.tiki.vn/product-detail/api/v1/products/{}"
@@ -97,7 +103,7 @@ def main():
 
     product_ids = load_product_ids("product_ids.csv")
     total = len(product_ids)
-    print(f"Total products to process: {total}")
+    logging.info(f"Total products to process: {total}")
 
     for i in range(0, total, BATCH_SIZE):
         batch = product_ids[i:i + BATCH_SIZE]
@@ -105,7 +111,7 @@ def main():
 
     end_time = time.time() # End the timer
     elapsed_minutes = (end_time - start_time)/60
-    print(f"\n✅ Total time taken: {elapsed_minutes:.2f} minutes")
+    logging.info(f"\n✅ Total time taken: {elapsed_minutes:.2f} minutes")
 
     # Save error log if there are errors
     if error_log:
@@ -114,7 +120,7 @@ def main():
             f.write("product_id,error_reason\n")
             for pid, reason in error_log:
                 f.write(f"{pid},{reason}\n")
-        print(f"\n⚠️  Logged {len(error_log)} errors to {error_file}")
+        logging.info(f"\n⚠️  Logged {len(error_log)} errors to {error_file}")
 
 if __name__ == "__main__":
     main()

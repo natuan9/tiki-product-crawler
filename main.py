@@ -1,3 +1,4 @@
+import logging
 from ratelimit import limits, sleep_and_retry
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 import requests
@@ -9,13 +10,20 @@ import re
 import csv
 from bs4 import BeautifulSoup
 import time
-from typing import Tuple
+from typing import Tuple, Set
+import glob
+
+logging.basicConfig(
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    level=logging.INFO
+)
 
 # === Configuration ===
 API_URL = "https://api.tiki.vn/product-detail/api/v1/products/{}"
 BATCH_SIZE = 1000
 MAX_WORKERS = 20
 OUTPUT_DIR = "products_output"
+PROGRESS_FILE = "crawl_progress.json"
 # Set rate limit: max 5 requests per second
 RATE_LIMIT = 50
 TIME_PERIOD = 1  # seconds
@@ -25,6 +33,7 @@ error_log: list[Tuple[str, str]] = []
 
 # === Create output directory if it doesn't exist ===
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 def load_product_ids(file_path: str) -> list:
     product_ids = []
@@ -36,12 +45,73 @@ def load_product_ids(file_path: str) -> list:
                 product_ids.append(row[0].strip())
     return product_ids
 
+
+def load_progress() -> dict:
+    """Load crawling progress from file"""
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                progress = json.load(f)
+                logging.info(f"Loaded progress: processed {progress.get('processed_count', 0)} products")
+                return progress
+        except (json.JSONDecodeError, FileNotFoundError):
+            logging.warning("Could not load progress file, starting from scratch")
+    return {"processed_ids": [], "current_batch": 0, "processed_count": 0, "start_time": time.time()}
+
+
+def save_progress(progress: dict):
+    """Save crawling progress to file"""
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+        json.dump(progress, f, ensure_ascii=False, indent=2)
+
+
+def get_already_crawled_ids() -> Set[str]:
+    """Get set of product IDs that have already been successfully crawled"""
+    crawled_ids = set()
+
+    # Check all existing batch files
+    batch_files = glob.glob(f"{OUTPUT_DIR}/products_batch_*.json")
+
+    for batch_file in batch_files:
+        try:
+            with open(batch_file, "r", encoding="utf-8") as f:
+                products = json.load(f)
+                for product in products:
+                    if product and product.get("id"):
+                        crawled_ids.add(str(product["id"]))
+        except (json.JSONDecodeError, FileNotFoundError):
+            logging.warning(f"Could not read batch file: {batch_file}")
+
+    logging.info(f"Found {len(crawled_ids)} already crawled products")
+    return crawled_ids
+
+
+def get_failed_ids() -> Set[str]:
+    """Get set of product IDs that failed in previous runs"""
+    failed_ids = set()
+    error_file = os.path.join(OUTPUT_DIR, "errors_log.csv")
+
+    if os.path.exists(error_file):
+        try:
+            with open(error_file, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader, None)  # Skip header
+                for row in reader:
+                    if row and len(row) >= 1:
+                        failed_ids.add(row[0].strip())
+        except Exception as e:
+            logging.warning(f"⚠️  Could not read error log: {e}")
+
+    return failed_ids
+
+
 # === Clean and normalize product description ===
 def clean_description(html_desc: str) -> str:
     soup = BeautifulSoup(html_desc or "", "html.parser")
     text = soup.get_text(separator=" ", strip=True)
     text = re.sub(r'\s+', ' ', text)  # Remove extra spaces
     return text.strip()
+
 
 @sleep_and_retry
 @limits(calls=RATE_LIMIT, period=TIME_PERIOD)
@@ -80,41 +150,113 @@ def fetch_product(product_id: str):
         error_log.append((product_id, f"HTTP {response.status_code}"))
         return None
 
+
 # === Crawl and save a batch of products ===
-def crawl_batch(product_ids: list, batch_index: int):
+def crawl_batch(product_ids: list, batch_index: int, progress: dict):
     results = []
+    processed_in_batch = 0
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for product in tqdm(executor.map(fetch_product, product_ids), total=len(product_ids), desc=f"Batch {batch_index}"):
+        for product in tqdm(executor.map(fetch_product, product_ids), total=len(product_ids),
+                            desc=f"Batch {batch_index}"):
             if product:
                 results.append(product)
+                processed_in_batch += 1
+
+                # Update progress every 10 products
+                if processed_in_batch % 10 == 0:
+                    progress["processed_count"] += 10
+                    progress["current_batch"] = batch_index
+                    save_progress(progress)
 
     # Save results to a JSON file
-    with open(f"{OUTPUT_DIR}/products_batch_{batch_index:03d}.json", "w", encoding="utf-8") as f:
+    batch_file = f"{OUTPUT_DIR}/products_batch_{batch_index:03d}.json"
+    with open(batch_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
+    # Update final progress for this batch
+    remaining_processed = processed_in_batch % 10
+    if remaining_processed > 0:
+        progress["processed_count"] += remaining_processed
+
+    progress["current_batch"] = batch_index + 1
+    save_progress(progress)
+
+    logging.info(f"✅ Completed batch {batch_index}: {len(results)} products saved to {batch_file}")
+
+
+def filter_products_to_process(product_ids: list, already_crawled: Set[str], failed_ids: Set[str],
+                               retry_failed: bool = False) -> list:
+    """Filter out already processed products"""
+    to_process = []
+
+    for pid in product_ids:
+        if pid not in already_crawled:
+            if retry_failed or pid not in failed_ids:
+                to_process.append(pid)
+
+    return to_process
+
+
 def main():
-    start_time = time.time() # Start the timer
+    # Load progress
+    progress = load_progress()
+    start_time = progress.get("start_time", time.time())
 
-    product_ids = load_product_ids("product_ids.csv")
-    total = len(product_ids)
-    print(f"Total products to process: {total}")
+    # Load product IDs
+    all_product_ids = load_product_ids("product_ids.csv")
+    logging.info(f"Loaded {len(all_product_ids)} total product IDs from CSV")
 
-    for i in range(0, total, BATCH_SIZE):
-        batch = product_ids[i:i + BATCH_SIZE]
-        crawl_batch(batch, i // BATCH_SIZE)
+    # Get already processed products
+    already_crawled = get_already_crawled_ids()
+    failed_ids = get_failed_ids()
 
-    end_time = time.time() # End the timer
-    elapsed_minutes = (end_time - start_time)/60
-    print(f"\n✅ Total time taken: {elapsed_minutes:.2f} minutes")
+    # Filter products that still need to be processed
+    # Set retry_failed=True if you want to retry previously failed products
+    products_to_process = filter_products_to_process(all_product_ids, already_crawled, failed_ids, retry_failed=False)
+
+    if not products_to_process:
+        logging.info("All products have already been processed!")
+        return
+
+    logging.info(f"Resuming crawl: {len(products_to_process)} products remaining to process")
+    logging.info(
+        f"Progress: {len(already_crawled)}/{len(all_product_ids)} products completed ({len(already_crawled) / len(all_product_ids) * 100:.1f}%)")
+
+    # Start processing from where we left off
+    current_batch = progress.get("current_batch", 0)
+
+    for i in range(0, len(products_to_process), BATCH_SIZE):
+        batch = products_to_process[i:i + BATCH_SIZE]
+        batch_index = current_batch + (i // BATCH_SIZE)
+
+        logging.info(f"Processing batch {batch_index}: {len(batch)} products")
+        crawl_batch(batch, batch_index, progress)
+
+    end_time = time.time()
+    total_elapsed_minutes = (end_time - start_time) / 60
+    logging.info(f"\nCrawling completed! Total time: {total_elapsed_minutes:.2f} minutes")
 
     # Save error log if there are errors
     if error_log:
         error_file = os.path.join(OUTPUT_DIR, "errors_log.csv")
-        with open(error_file, "w", encoding="utf-8") as f:
-            f.write("product_id,error_reason\n")
+
+        # Append to existing error log instead of overwriting
+        write_header = not os.path.exists(error_file)
+        with open(error_file, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("product_id,error_reason\n")
             for pid, reason in error_log:
                 f.write(f"{pid},{reason}\n")
-        print(f"\n⚠️  Logged {len(error_log)} errors to {error_file}")
+        logging.info(f"\n⚠️  Logged {len(error_log)} new errors to {error_file}")
+
+    # Clean up progress file when done
+    final_crawled = get_already_crawled_ids()
+    if len(final_crawled) >= len(all_product_ids):
+        if os.path.exists(PROGRESS_FILE):
+            os.remove(PROGRESS_FILE)
+            logging.info("Removed progress file - crawling completed!")
+
 
 if __name__ == "__main__":
     main()

@@ -182,6 +182,20 @@ def crawl_batch(product_ids: list, batch_index: int, progress: dict):
     progress["current_batch"] = batch_index + 1
     save_progress(progress)
 
+    # Save batch-level errors
+    if error_log:
+        error_file = os.path.join(OUTPUT_DIR, "errors_log.csv")
+        write_header = not os.path.exists(error_file)
+
+        with open(error_file, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("product_id,error_reason\n")
+            for pid, reason in error_log:
+                f.write(f"{pid},{reason}\n")
+                logging.warning(f"❌ Error fetching product {pid}: {reason}")
+
+        error_log.clear()  # reset for next batch
+
     logging.info(f"✅ Completed batch {batch_index}: {len(results)} products saved to {batch_file}")
 
 
@@ -236,19 +250,6 @@ def main():
     end_time = time.time()
     total_elapsed_minutes = (end_time - start_time) / 60
     logging.info(f"\nCrawling completed! Total time: {total_elapsed_minutes:.2f} minutes")
-
-    # Save error log if there are errors
-    if error_log:
-        error_file = os.path.join(OUTPUT_DIR, "errors_log.csv")
-
-        # Append to existing error log instead of overwriting
-        write_header = not os.path.exists(error_file)
-        with open(error_file, "a", encoding="utf-8") as f:
-            if write_header:
-                f.write("product_id,error_reason\n")
-            for pid, reason in error_log:
-                f.write(f"{pid},{reason}\n")
-        logging.info(f"\n⚠️  Logged {len(error_log)} new errors to {error_file}")
 
     # Clean up progress file when done
     final_crawled = get_already_crawled_ids()

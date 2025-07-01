@@ -12,21 +12,44 @@ from bs4 import BeautifulSoup
 import time
 from typing import Tuple, Set
 import glob
+from configparser import ConfigParser
+
 
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     level=logging.INFO
 )
 
-# === Configuration ===
-API_URL = "https://api.tiki.vn/product-detail/api/v1/products/{}"
-BATCH_SIZE = 1000
-MAX_WORKERS = 20
-OUTPUT_DIR = "products_output"
-PROGRESS_FILE = "crawl_progress.json"
-# Set rate limit: max 5 requests per second
-RATE_LIMIT = 50
-TIME_PERIOD = 1  # seconds
+def load_crawler_config(filename="crawler.ini", section="crawler"):
+    parser = ConfigParser()
+    parser.read(filename)
+
+    if not parser.has_section(section):
+        raise Exception(f"Section {section} not found in {filename}")
+
+    config = {}
+    for key, value in parser.items(section):
+        # Try to convert numbers
+        if value.isdigit():
+            config[key] = int(value)
+        else:
+            try:
+                config[key] = float(value)
+            except ValueError:
+                config[key] = value
+    return config
+
+crawler_config = load_crawler_config()
+logging.info(f"Crawler config loaded: {crawler_config}")
+
+
+API_URL = crawler_config['api_url']
+BATCH_SIZE = crawler_config['batch_size']
+MAX_WORKERS = crawler_config['max_workers']
+OUTPUT_DIR = crawler_config['output_dir']
+RATE_LIMIT = crawler_config['rate_limit']
+TIME_PERIOD = crawler_config['time_period']
+PROGRESS_FILE = crawler_config['progress_file']
 
 # Global list to track errors
 error_log: list[Tuple[str, str]] = []

@@ -143,7 +143,8 @@ def clean_description(html_desc: str) -> str:
     stop=stop_after_attempt(3),  # Retry max 3 times
     retry=retry_if_exception_type((requests.exceptions.RequestException,))
 )
-def fetch_product(product_id: str):
+def fetch_product(product_id: str, session: requests.Session):
+    print("Test session: ", session)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -153,7 +154,7 @@ def fetch_product(product_id: str):
         "Accept": "application/json",
     }
 
-    response = requests.get(API_URL.format(product_id), headers=headers, timeout=10)
+    response = session.get(API_URL.format(product_id), headers=headers, timeout=10)
 
     if response.status_code == 200:
         data = response.json()
@@ -179,18 +180,25 @@ def crawl_batch(product_ids: list, batch_index: int, progress: dict):
     results = []
     processed_in_batch = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for product in tqdm(executor.map(fetch_product, product_ids), total=len(product_ids),
-                            desc=f"Batch {batch_index}"):
-            if product:
-                results.append(product)
-                processed_in_batch += 1
+    with requests.Session() as session:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            def worker(pid):
+                try:
+                    return fetch_product(pid, session)
+                except Exception as e:
+                    error_log.append((pid, str(e)))
+                    return None
+            for product in tqdm(executor.map(worker, product_ids), total=len(product_ids),
+                                desc=f"Batch {batch_index}"):
+                if product:
+                    results.append(product)
+                    processed_in_batch += 1
 
-                # Update progress every 10 products
-                if processed_in_batch % 10 == 0:
-                    progress["processed_count"] += 10
-                    progress["current_batch"] = batch_index
-                    save_progress(progress)
+                    # Update progress every 10 products
+                    if processed_in_batch % 10 == 0:
+                        progress["processed_count"] += 10
+                        progress["current_batch"] = batch_index
+                        save_progress(progress)
 
     # Save results to a JSON file
     batch_file = f"{OUTPUT_DIR}/products_batch_{batch_index:03d}.json"

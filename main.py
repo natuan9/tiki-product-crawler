@@ -12,21 +12,44 @@ from bs4 import BeautifulSoup
 import time
 from typing import Tuple, Set
 import glob
+from configparser import ConfigParser
+
 
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     level=logging.INFO
 )
 
-# === Configuration ===
-API_URL = "https://api.tiki.vn/product-detail/api/v1/products/{}"
-BATCH_SIZE = 1000
-MAX_WORKERS = 20
-OUTPUT_DIR = "products_output"
-PROGRESS_FILE = "crawl_progress.json"
-# Set rate limit: max 5 requests per second
-RATE_LIMIT = 50
-TIME_PERIOD = 1  # seconds
+def load_crawler_config(filename="crawler.ini", section="crawler"):
+    parser = ConfigParser()
+    parser.read(filename)
+
+    if not parser.has_section(section):
+        raise Exception(f"Section {section} not found in {filename}")
+
+    config = {}
+    for key, value in parser.items(section):
+        # Try to convert numbers
+        if value.isdigit():
+            config[key] = int(value)
+        else:
+            try:
+                config[key] = float(value)
+            except ValueError:
+                config[key] = value
+    return config
+
+crawler_config = load_crawler_config()
+logging.info(f"Crawler config loaded: {crawler_config}")
+
+
+API_URL = crawler_config['api_url']
+BATCH_SIZE = crawler_config['batch_size']
+MAX_WORKERS = crawler_config['max_workers']
+OUTPUT_DIR = crawler_config['output_dir']
+RATE_LIMIT = crawler_config['rate_limit']
+TIME_PERIOD = crawler_config['time_period']
+PROGRESS_FILE = crawler_config['progress_file']
 
 # Global list to track errors
 error_log: list[Tuple[str, str]] = []
@@ -120,7 +143,8 @@ def clean_description(html_desc: str) -> str:
     stop=stop_after_attempt(3),  # Retry max 3 times
     retry=retry_if_exception_type((requests.exceptions.RequestException,))
 )
-def fetch_product(product_id: str):
+def fetch_product(product_id: str, session: requests.Session):
+    print("Test session: ", session)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -130,7 +154,7 @@ def fetch_product(product_id: str):
         "Accept": "application/json",
     }
 
-    response = requests.get(API_URL.format(product_id), headers=headers, timeout=10)
+    response = session.get(API_URL.format(product_id), headers=headers, timeout=10)
 
     if response.status_code == 200:
         data = response.json()
@@ -156,18 +180,25 @@ def crawl_batch(product_ids: list, batch_index: int, progress: dict):
     results = []
     processed_in_batch = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for product in tqdm(executor.map(fetch_product, product_ids), total=len(product_ids),
-                            desc=f"Batch {batch_index}"):
-            if product:
-                results.append(product)
-                processed_in_batch += 1
+    with requests.Session() as session:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            def worker(pid):
+                try:
+                    return fetch_product(pid, session)
+                except Exception as e:
+                    error_log.append((pid, str(e)))
+                    return None
+            for product in tqdm(executor.map(worker, product_ids), total=len(product_ids),
+                                desc=f"Batch {batch_index}"):
+                if product:
+                    results.append(product)
+                    processed_in_batch += 1
 
-                # Update progress every 10 products
-                if processed_in_batch % 10 == 0:
-                    progress["processed_count"] += 10
-                    progress["current_batch"] = batch_index
-                    save_progress(progress)
+                    # Update progress every 10 products
+                    if processed_in_batch % 10 == 0:
+                        progress["processed_count"] += 10
+                        progress["current_batch"] = batch_index
+                        save_progress(progress)
 
     # Save results to a JSON file
     batch_file = f"{OUTPUT_DIR}/products_batch_{batch_index:03d}.json"
@@ -181,6 +212,20 @@ def crawl_batch(product_ids: list, batch_index: int, progress: dict):
 
     progress["current_batch"] = batch_index + 1
     save_progress(progress)
+
+    # Save batch-level errors
+    if error_log:
+        error_file = os.path.join(OUTPUT_DIR, "errors_log.csv")
+        write_header = not os.path.exists(error_file)
+
+        with open(error_file, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("product_id,error_reason\n")
+            for pid, reason in error_log:
+                f.write(f"{pid},{reason}\n")
+                logging.warning(f"❌ Error fetching product {pid}: {reason}")
+
+        error_log.clear()  # reset for next batch
 
     logging.info(f"✅ Completed batch {batch_index}: {len(results)} products saved to {batch_file}")
 
@@ -236,19 +281,6 @@ def main():
     end_time = time.time()
     total_elapsed_minutes = (end_time - start_time) / 60
     logging.info(f"\nCrawling completed! Total time: {total_elapsed_minutes:.2f} minutes")
-
-    # Save error log if there are errors
-    if error_log:
-        error_file = os.path.join(OUTPUT_DIR, "errors_log.csv")
-
-        # Append to existing error log instead of overwriting
-        write_header = not os.path.exists(error_file)
-        with open(error_file, "a", encoding="utf-8") as f:
-            if write_header:
-                f.write("product_id,error_reason\n")
-            for pid, reason in error_log:
-                f.write(f"{pid},{reason}\n")
-        logging.info(f"\n⚠️  Logged {len(error_log)} new errors to {error_file}")
 
     # Clean up progress file when done
     final_crawled = get_already_crawled_ids()
